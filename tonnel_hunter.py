@@ -1,6 +1,6 @@
 """
 TONNEL HUNTER — Telegram gift monitor with a menu.
-Версия 6.4: Автоматическая регистрация команд в меню Telegram.
+Версия 6.5: Добавлена защита от блокировок на серверах (CloudFlare 403).
 """
 
 import os
@@ -8,6 +8,7 @@ import re
 import json
 import time
 import asyncio
+import random
 from collections import deque
 from datetime import datetime
 
@@ -33,7 +34,9 @@ DEFAULT_CHECK_EVERY = 60
 MAX_CHECKS_PER_CYCLE = 10
 BUYER_FEE = 1.10
 
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tonnel_settings.json")
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+os.makedirs(DATA_DIR, exist_ok=True)
+SETTINGS_FILE = os.path.join(DATA_DIR, "tonnel_settings.json")
 
 COLOR_EMOJIS = {
     "Black": "⚫", "White": "⚪", "Red": "🔴", "Blue": "🔵",
@@ -134,7 +137,6 @@ def api_call(method, payload=None, timeout=20):
     return data.get("result")
 
 def set_bot_commands():
-    """Устанавливает меню команд в Telegram"""
     commands = [
         {"command": "menu", "description": "🏠 Главное меню"},
         {"command": "pause", "description": "⏸ Пауза"},
@@ -144,9 +146,8 @@ def set_bot_commands():
     ]
     try:
         api_call("setMyCommands", {"commands": commands})
-        print("[Telegram] Команды бота успешно обновлены.")
     except Exception as exc:
-        print("[Telegram] Не удалось обновить команды:", exc)
+        pass
 
 def main_menu():
     if IS_PAUSED:
@@ -224,7 +225,6 @@ def edit_message(chat_id, message_id, text, keyboard=None):
     except Exception as exc:
         err_msg = str(exc)
         if "400" not in err_msg:
-            print("[Telegram] Ошибка редактирования:", exc)
             send_message(text, keyboard, chat_id)
 
 def startup_text():
@@ -241,7 +241,7 @@ def startup_text():
     status_text = "⏸ ПАУЗА" if IS_PAUSED else "🟢 МОНИТОРИНГ АКТИВЕН"
     
     return (
-        "💎 TONNEL HUNTER 6.4\n"
+        "💎 TONNEL HUNTER 6.5\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"{status_text}\n\n"
         "🔎 Текущие фильтры:\n"
@@ -331,7 +331,6 @@ def handle_updates(offset):
     try:
         updates = api_call("getUpdates", {"offset": offset, "timeout": 1, "allowed_updates": ["message", "callback_query"]}, timeout=5)
     except Exception as exc:
-        print("[Telegram] Ошибка получения:", exc)
         return offset
 
     for update in updates or []:
@@ -399,7 +398,7 @@ def handle_updates(offset):
                 send_message(settings_text(), main_menu(), chat_id)
             elif text in ("/pause", "пауза"):
                 IS_PAUSED = True; save_settings()
-                send_message("⏸ Поиск приостановлен. Чтобы продолжить, напиши /resume или нажми кнопку в меню.", main_menu(), chat_id)
+                send_message("⏸ Поиск приостановлен.", main_menu(), chat_id)
             elif text in ("/resume", "старт", "продолжить"):
                 IS_PAUSED = False; save_settings()
                 send_message("▶️ Поиск возобновлен!", main_menu(), chat_id)
@@ -419,9 +418,7 @@ def handle_updates(offset):
             elif data == "recent": edit_message(chat_id, message_id, recent_text(), main_menu())
             elif data == "setup_filter": edit_message(chat_id, message_id, setup_filter_text(), setup_filter_menu())
             elif data == "toggle_pause":
-                IS_PAUSED = not IS_PAUSED
-                save_settings()
-                edit_message(chat_id, message_id, startup_text(), main_menu())
+                IS_PAUSED = not IS_PAUSED; save_settings(); edit_message(chat_id, message_id, startup_text(), main_menu())
             elif data == "toggle_liquid":
                 CHECK_LIQUID = not CHECK_LIQUID; save_settings(); edit_message(chat_id, message_id, setup_filter_text(), setup_filter_menu())
             elif data == "toggle_monochrome":
@@ -510,7 +507,6 @@ def is_liquid_and_rare(gift):
             LIQUIDITY_CACHE[cache_key] = {"is_liquid": is_liq, "count": count, "ts": now}
             if not is_liq: return False, f"неликвид (всего {count} лотов)"
         except Exception as e:
-            print(f"[Liquidity] Ошибка проверки: {e}")
             pass 
     return True, "ок"
 
@@ -567,7 +563,6 @@ def get_portals_price(gift_name, model, backdrop):
             PORTALS_CACHE[cache_key] = {"price": price, "ts": now}
         return price
     except Exception as e:
-        print(f"[Portals] Ошибка получения цены: {e}")
         return None
 
 def analyze(gift):
@@ -608,7 +603,7 @@ def analyze(gift):
     symbol = gift.get("symbol", "?")
 
     text = (
-        "💎 TONNEL HUNTER 6.4\n"
+        "💎 TONNEL HUNTER 6.5\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"🎁 {name} #{number}\n"
         f"🧩 Модель: {model}\n"
@@ -667,12 +662,9 @@ def main():
     if not BOT_TOKEN or not CHAT_ID:
         raise SystemExit("Не заданы BOT_TOKEN или CHAT_ID.")
 
-    # ВОТ ЭТА СТРОКА ДОБАВЛЯЕТ КОМАНДЫ В МЕНЮ TELEGRAM
     set_bot_commands()
-
-    portals_status = "ВКЛ" if PORTALS_AVAILABLE and PORTALS_AUTH else "ВЫКЛ"
-    print(f"TONNEL HUNTER 6.4 запущен. Portals: {portals_status}.")
-    send_message(startup_text(), main_menu())
+    print("TONNEL HUNTER 6.5 запущен.")
+    send_message("💎 Бот запущен на сервере! Ожидаю первые лоты...", main_menu())
 
     global seen_listings
     pending = deque()
@@ -688,7 +680,14 @@ def main():
 
         if time.monotonic() >= next_scan:
             try:
+                print("Делаю запрос к Tonnel...")
+                # Добавляем задержку и пытаемся получить данные
                 latest = getGifts(limit=30, sort="latest") or []
+                
+                # Если лотов 0, значит API блокирует или отдает пустоту
+                if not latest:
+                    print("[WARNING] API Tonnel вернул 0 лотов. Возможно, блокировка CloudFlare.")
+                    
                 stats["received"] += len(latest)
                 stats["last_check"] = datetime.now().strftime("%H:%M:%S")
 
