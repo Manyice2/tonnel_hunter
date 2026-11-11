@@ -1,6 +1,6 @@
 """
 TONNEL HUNTER — Telegram gift monitor with a menu.
-Версия 6.6: Упрощенная для запуска на сервере. Ошибки выводятся в Telegram.
+Версия 6.7: Полная версия (как 6.4) для работы на домашнем ПК.
 """
 
 import os
@@ -8,7 +8,6 @@ import re
 import json
 import time
 import asyncio
-import random
 from collections import deque
 from datetime import datetime
 
@@ -34,9 +33,7 @@ DEFAULT_CHECK_EVERY = 60
 MAX_CHECKS_PER_CYCLE = 10
 BUYER_FEE = 1.10
 
-DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
-os.makedirs(DATA_DIR, exist_ok=True)
-SETTINGS_FILE = os.path.join(DATA_DIR, "tonnel_settings.json")
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tonnel_settings.json")
 
 COLOR_EMOJIS = {
     "Black": "⚫", "White": "⚪", "Red": "🔴", "Blue": "🔵",
@@ -146,8 +143,9 @@ def set_bot_commands():
     ]
     try:
         api_call("setMyCommands", {"commands": commands})
-    except Exception:
-        pass
+        print("[Telegram] Команды бота успешно обновлены.")
+    except Exception as exc:
+        print("[Telegram] Не удалось обновить команды:", exc)
 
 def main_menu():
     if IS_PAUSED:
@@ -225,6 +223,7 @@ def edit_message(chat_id, message_id, text, keyboard=None):
     except Exception as exc:
         err_msg = str(exc)
         if "400" not in err_msg:
+            print("[Telegram] Ошибка редактирования:", exc)
             send_message(text, keyboard, chat_id)
 
 def startup_text():
@@ -241,7 +240,7 @@ def startup_text():
     status_text = "⏸ ПАУЗА" if IS_PAUSED else "🟢 МОНИТОРИНГ АКТИВЕН"
     
     return (
-        "💎 TONNEL HUNTER 6.6\n"
+        "💎 TONNEL HUNTER 6.7\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"{status_text}\n\n"
         "🔎 Текущие фильтры:\n"
@@ -331,6 +330,7 @@ def handle_updates(offset):
     try:
         updates = api_call("getUpdates", {"offset": offset, "timeout": 1, "allowed_updates": ["message", "callback_query"]}, timeout=5)
     except Exception as exc:
+        print("[Telegram] Ошибка получения:", exc)
         return offset
 
     for update in updates or []:
@@ -439,6 +439,7 @@ def handle_updates(offset):
                 edit_message(chat_id, message_id, "🔝 Введи новую максимальную цену в TON (например 25).\nЧтобы отключить лимит, напиши «без лимита».", {"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "setup_filter"}]]})
     return offset
 
+
 # ---------------- ЛОГИКА ФИЛЬТРАЦИИ ----------------
 
 def is_candidate(gift):
@@ -461,6 +462,55 @@ def tonnel_link(gift):
     gift_id = gift.get("gift_id")
     return f"https://t.me/tonnel_network_bot/gift?startapp={gift_id}" if gift_id else ""
 
+def get_color_family(text):
+    text_lower = text.lower()
+    matched_families = set()
+    if "monochrome" in text_lower: return "monochrome"
+    for family, keywords in COLOR_FAMILIES.items():
+        for kw in keywords:
+            if kw in text_lower:
+                matched_families.add(family)
+                break
+    if len(matched_families) == 1: return list(matched_families)[0]
+    return None
+
+def is_monochrome(model_str, backdrop_str):
+    model_lower = model_str.lower(); backdrop_lower = backdrop_str.lower()
+    if "monochrome" in model_lower or "monochrome" in backdrop_lower: return True
+    fam_model = get_color_family(model_str); fam_backdrop = get_color_family(backdrop_str)
+    if fam_model and fam_backdrop and fam_model == fam_backdrop: return True
+    for color in ["black", "white", "red", "blue", "green", "yellow", "purple", "orange", "pink", "gray"]:
+        if color in model_lower and color in backdrop_lower: return True
+    return False
+
+def is_liquid_and_rare(gift):
+    name = str(gift.get("name", "")); model = str(gift.get("model", "")); backdrop = str(gift.get("backdrop", ""))
+    
+    if CHECK_MONOCHROME and not is_monochrome(model, backdrop):
+        return False, "не монохром (цвета не совпадают)"
+
+    if TARGET_BACKDROP is not None and TARGET_BACKDROP.lower() not in backdrop.lower():
+        return False, f"фон не совпадает ({TARGET_BACKDROP})"
+
+    if CHECK_LIQUID:
+        cache_key = (name, model, backdrop)
+        now = time.time()
+        if cache_key in LIQUIDITY_CACHE:
+            cached = LIQUIDITY_CACHE[cache_key]
+            if now - cached["ts"] < CACHE_TTL:
+                if not cached["is_liquid"]: return False, f"неликвид (всего {cached['count']} лотов)"
+                return True, "ок"
+        try:
+            similar_lots = getGifts(gift_name=name, model=model, backdrop=backdrop, sort="price_asc", limit=10)
+            count = len(similar_lots) if similar_lots else 0
+            is_liq = count >= 2
+            LIQUIDITY_CACHE[cache_key] = {"is_liquid": is_liq, "count": count, "ts": now}
+            if not is_liq: return False, f"неликвид (всего {count} лотов)"
+        except Exception as e:
+            print(f"[Liquidity] Ошибка проверки: {e}")
+            pass 
+    return True, "ок"
+
 def get_reference_price(gift):
     cache_key = (gift.get("name"), gift.get("model"), gift.get("backdrop"), gift.get("symbol"))
     now = time.time()
@@ -480,6 +530,11 @@ def get_reference_price(gift):
         except Exception: pass
     if not valid_prices:
         try:
+            others = getGifts(gift_name=gift.get("name"), model=gift.get("model"), limit=10, sort="price_asc")
+            valid_prices = [o.get("price") for o in (others or []) if o.get("gift_id") != gift.get("gift_id") and is_candidate(o)]
+        except Exception: pass
+    if not valid_prices:
+        try:
             others = getGifts(gift_name=gift.get("name"), limit=10, sort="price_asc")
             valid_prices = [o.get("price") for o in (others or []) if o.get("gift_id") != gift.get("gift_id") and is_candidate(o)]
         except Exception: pass
@@ -488,21 +543,60 @@ def get_reference_price(gift):
     REFERENCE_CACHE[cache_key] = {"price": ref_price, "ts": now}
     return ref_price
 
+def get_portals_price(gift_name, model, backdrop):
+    if not PORTALS_AVAILABLE or not PORTALS_AUTH: return None
+    
+    cache_key = f"{gift_name}_{model}_{backdrop}"
+    now = time.time()
+    if cache_key in PORTALS_CACHE:
+        cached = PORTALS_CACHE[cache_key]
+        if now - cached["ts"] < 120: return cached["price"]
+
+    try:
+        async def _fetch():
+            listings = await portals.search(gift_name=gift_name, model=model, backdrop=backdrop, sort="price_asc", limit=5, authData=PORTALS_AUTH)
+            if listings:
+                return min(float(g.price) for g in listings)
+            return None
+        
+        price = asyncio.run(_fetch())
+        if price:
+            PORTALS_CACHE[cache_key] = {"price": price, "ts": now}
+        return price
+    except Exception as e:
+        print(f"[Portals] Ошибка получения цены: {e}")
+        return None
+
 def analyze(gift):
-    if not is_candidate(gift): return None, "не обычный лот"
+    if not is_candidate(gift): return None, "не обычный лот в продаже"
     price = gift["price"]
-    if price < MIN_PRICE: return None, "цена ниже минимума"
+    if price < MIN_PRICE: return None, f"цена ниже {MIN_PRICE:g} TON"
     if MAX_PRICE is not None and price > MAX_PRICE: return None, "цена выше максимума"
 
+    liquid_ok, liquid_reason = is_liquid_and_rare(gift)
+    if not liquid_ok: return None, liquid_reason
+
     tonnel_ref_price = get_reference_price(gift)
-    if not tonnel_ref_price or tonnel_ref_price <= 0: return None, "не найден эталон"
+    if not tonnel_ref_price or tonnel_ref_price <= 0: return None, "не найден эталон на Tonnel"
+
+    portals_price = get_portals_price(gift.get("name"), gift.get("model"), gift.get("backdrop"))
 
     total_price = price * BUYER_FEE
     discount = (tonnel_ref_price - price) / tonnel_ref_price * 100
-    profit = tonnel_ref_price - total_price
+    
+    best_sell_price = tonnel_ref_price
+    best_sell_platform = "Tonnel"
+    
+    if portals_price and portals_price > best_sell_price:
+        best_sell_price = portals_price
+        best_sell_platform = "Portals"
+        
+    profit = best_sell_price - total_price
 
-    if discount < MIN_DISCOUNT or profit <= 0:
+    if discount < MIN_DISCOUNT and profit <= 0:
         return None, f"нет выгоды (скидка {discount:.1f}%)"
+    if profit <= 0:
+        return None, f"нет чистой прибыли после комиссии"
 
     name = str(gift.get("name", "Подарок"))
     number = gift.get("gift_num", "?")
@@ -511,7 +605,7 @@ def analyze(gift):
     symbol = gift.get("symbol", "?")
 
     text = (
-        "💎 TONNEL HUNTER 6.6\n"
+        "💎 TONNEL HUNTER 6.7\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"🎁 {name} #{number}\n"
         f"🧩 Модель: {model}\n"
@@ -520,20 +614,49 @@ def analyze(gift):
         "💰 ЦЕНА И ВЫГОДА\n"
         f"• Цена лота: {price:g} TON\n"
         f"• С комиссией: {total_price:.2f} TON\n"
-        f"• Флор: {tonnel_ref_price:g} TON\n"
-        f"• Скидка: {discount:.1f}%\n"
-        f"• Чистая разница: {profit:.2f} TON\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ Проверь стакан вручную!"
+        f"• Флор на Tonnel: {tonnel_ref_price:g} TON\n"
+    )
+    
+    if portals_price:
+        text += f"• Флор на Portals: {portals_price:g} TON\n"
+    else:
+        text += "• Флор на Portals: нет данных\n"
+
+    text += f"• Скидка: {discount:.1f}%\n"
+
+    if best_sell_platform == "Portals" and portals_price:
+        text += (
+            f"\n🚀 АРБИТРАЖ!\n"
+            f"🛒 Купить тут: {price:g} TON\n"
+            f"💰 Продать на Portals: {portals_price:g} TON\n"
+            f"📈 Профит: ~{profit:.2f} TON\n"
+        )
+    else:
+        text += (
+            f"• Чистая разница: {profit:.2f} TON\n"
+        )
+
+    text += (
+        "\n━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ Проверь стакан вручную перед покупкой!"
     )
 
     buttons = []
     marketplace_url = tonnel_link(gift)
     if marketplace_url:
         buttons.append({"text": "🛒 Купить на Tonnel", "url": marketplace_url})
+        
+    search_query = name.replace(" ", "%20")
+    if model:
+        search_query += f"%20{model.replace(' ', '%20')}"
+    
+    portals_web_url = f"https://portals-market.com/?search={search_query}"
+    buttons.append({"text": "🔍 Открыть на Portals", "url": portals_web_url})
+
     buttons.append({"text": "🎁 Подарок в TG", "url": gift_link(gift)})
 
     return (text, {"inline_keyboard": [buttons]}, {"name": name, "num": number, "price": price, "discount": discount}), "подходит"
+
 
 # ---------------- MAIN ----------------
 
@@ -542,8 +665,8 @@ def main():
         raise SystemExit("Не заданы BOT_TOKEN или CHAT_ID.")
 
     set_bot_commands()
-    print("TONNEL HUNTER 6.6 запущен.")
-    send_message("💎 Бот запущен! Ожидаю лоты...", main_menu())
+    print("TONNEL HUNTER 6.7 запущен.")
+    send_message(startup_text(), main_menu())
 
     global seen_listings
     pending = deque()
@@ -559,18 +682,11 @@ def main():
 
         if time.monotonic() >= next_scan:
             try:
-                print("Делаю запрос к Tonnel...")
                 latest = getGifts(limit=30, sort="latest") or []
-                
-                if not latest:
-                    print("[WARNING] API Tonnel вернул 0 лотов.")
-                    # Если API молчит, отправим один раз уведомление в ТГ
-                    if stats["errors"] == 0:
-                        send_message("⚠️ Внимание: API Tonnel не отвечает. Возможно, IP сервера заблокирован.", chat_id=CHAT_ID)
-
                 stats["received"] += len(latest)
                 stats["last_check"] = datetime.now().strftime("%H:%M:%S")
 
+                added = 0
                 for gift in latest:
                     gift_id = gift.get("gift_id")
                     price = gift.get("price")
@@ -579,31 +695,36 @@ def main():
                         continue
                     seen_listings.add(key)
                     pending.append(gift)
+                    added += 1
 
                 checked = 0
                 while pending and checked < MAX_CHECKS_PER_CYCLE:
-                    if IS_PAUSED: break
+                    if IS_PAUSED:
+                        break
+                        
                     gift = pending.popleft()
                     checked += 1
                     stats["checked"] += 1
                     try:
                         result, reason = analyze(gift)
+                        label = f"{gift.get('name', '?')} #{gift.get('gift_num', '?')}"
                         if result:
                             text, keyboard, deal_data = result
                             if send_message(text, keyboard):
                                 stats["deals"] += 1
                                 recent_deals.appendleft(deal_data)
+                                print(f"[НАХОДКА] {label}")
                         else:
-                            pass
+                            print(f"[Пропуск] {label}: {reason}")
                     except Exception as exc:
-                        pass
+                        pending.appendleft(gift)
+                        stats["errors"] += 1
+                        break
                     time.sleep(1)
 
             except Exception as exc:
                 stats["errors"] += 1
                 print("[Ошибка Tonnel]:", repr(exc))
-                if stats["errors"] == 3:
-                    send_message(f"⚠️ Ошибка подключения к Tonnel:\n`{repr(exc)}`", chat_id=CHAT_ID)
 
             next_scan = time.monotonic() + CHECK_EVERY
 
